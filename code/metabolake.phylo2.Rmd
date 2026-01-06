@@ -1,0 +1,973 @@
+---
+title: "Rpf: generality"
+author: "Jay T. Lennon"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+header-includes:
+   - \usepackage{array}
+output: pdf_document
+geometry: margin=2.54cm
+---
+
+Characterizing distribution of metabolic activity among lake isolates
+
+## Clear workspace and set directory
+
+```{r setup}
+rm(list=ls())
+getwd()
+setwd("~/GitHub/metabolake/")
+```
+
+## Load packages and functions
+
+```{r}
+need <- function(pkgs) pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+
+bioc_pkgs <- c("Biostrings", "msa")
+cran_pkgs <- c(
+  "png", "dplyr", "grid", "psych", "seqinr", "ape", "phylobase",
+  "RColorBrewer", "phytools", "geiger", "picante", "lme4",
+  "lmerTest", "adephylo", "bios2mds"
+)
+
+# BiocManager if needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install missing Bioconductor packages
+to_install_bioc <- need(bioc_pkgs)
+if (length(to_install_bioc))
+  BiocManager::install(to_install_bioc, ask = FALSE, update = TRUE)
+
+# Install missing CRAN packages
+to_install_cran <- need(cran_pkgs)
+if (length(to_install_cran))
+  install.packages(to_install_cran)
+
+# Load everything (quietly)
+all_pkgs <- c(cran_pkgs, bioc_pkgs)
+invisible(lapply(all_pkgs, function(p)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+))
+
+# Your functions
+source("~/GitHub/metabolake/bin/Phylo4D.JTL.R")
+# SEM
+sem <- function(x) {
+  sd(x) / sqrt(length(x))
+}
+
+# Confidence Hulls
+add.hull <- function(model = "", pred.frame = ""){
+  CI.U <- predict(model, interval = "c", newdata=pred.frame)[, "upr"]
+  CI.L <- predict(model, interval = "c", newdata=pred.frame)[, "lwr"]
+  pred.frame2 <- unlist(pred.frame)
+  X.Vec <- c(pred.frame2, tail(pred.frame2, 1), rev(pred.frame2),
+               head(pred.frame2, 1))
+  Y.Vec <- c(CI.U, tail(CI.L, 1), rev(CI.L), head(CI.U,1))
+  polygon(X.Vec, Y.Vec, col = "gray90", border = NA)
+}
+```
+
+## Preparing sequence reads
+
+```{bash, results = 'hide', eval = FALSE}
+# step 1. sequence forward and reverse direction for long coverage
+# step 2. create two fasta files (forward and reverse) with same id names
+# step 3. reverse the reverse reads:
+# seqkit seq -t dna -r -p IUB_reverse.fasta > IUB_reverse.rc.fasta
+# step 4. merge sequences
+# brew tap brewsci/bio
+# brew install emboss
+# 
+
+# securely transferred alignment (UL.afa) and Slurm script (UL.ml.sh) into project space on Quartz.
+# scp UL.afa UL.ml.sh lennonj@quartz.uits.iu.edu:/N/project/Lennon_Sequences/metabolake/
+# created and ran script ((UL.ml.sh) using raxmlng/1.2.0
+# sbatch /N/project/Lennon_Sequences/metabolake/UL.ml.sh
+# check status: squeue -u $USER
+# watch live log: tail -F /N/project/Lennon_Sequences/metabolake/ULTreeNG.*.out
+# took less than 10 minutes to complete
+# exported output back to local machine:
+# scp lennonj@quartz.uits.iu.edu:/N/project/Lennon_Sequences/metabolake/UL.ml.raxml.* ~/Desktop/
+```
+
+## Visualize sequence alignment
+
+```{r}
+# Read aligned FASTA
+aln_path <- "data/aligned.afa"     # or "analysis/aligned.trim.afa" if you trimmed
+dna <- read.dna(aln_path, format = "fasta")  # DNAbin matrix (rows = taxa, cols = sites)
+
+# Identify base pair region of 16S rRNA gene to visualize
+start <- 100
+end   <- 1200
+end   <- min(end, ncol(dna))  # clamp to alignment length
+if (start > ncol(dna)) stop("Start position is beyond alignment length.")
+window <- dna[, start:end, drop = FALSE]
+
+# Visualize the window
+par(mar = c(5, 5, 2, 1))
+image.DNAbin(window, cex.lab = 0.5)
+```
+
+# View maximum likelihood tree
+
+```{r}
+# 1. Read Alignment File {seqinr}
+tree <- read.tree("data/UL.rooted.raxml.support")
+
+# 2. Load map: data frame that relates sequence IDs to strains
+map <- read.csv("data/isolate.mapping.2.csv", stringsAsFactors = FALSE)
+stopifnot(all(c("ID","strain") %in% names(map)))
+map$ID     <- as.character(map$ID)
+map$strain <- as.character(map$strain)
+
+map <- map %>%
+  mutate(
+    ID     = as.character(ID),
+    strain = as.character(strain),
+    genus  = as.character(genus),
+    phytip = trimws(paste(genus, strain))  # "Dunganella IUB2501"
+  )
+
+# 3 Sanity checks
+missing_in_map <- base::setdiff(tree$tip.label, map$ID)
+dup_strain     <- map$strain[duplicated(map$strain)]
+
+if (length(missing_in_map) > 0)
+  warning("Some tips have no mapping and will be left as-is: ",
+          paste(missing_in_map, collapse = ", "))
+
+if (length(dup_strain) > 0)
+  warning("Mapped names are not unique (after mapping these may collide): ",
+          paste(unique(dup_strain), collapse = ", "))
+
+# 4. Apply mapping using match() (robust and fast)
+idx <- match(tree$tip.label, map$ID)        # index in 'map' for each tip (NA if no match)
+hits <- !is.na(idx)
+tree$tip.label[hits] <- map$strain[idx[hits]]  # replace only matched ones
+
+# 5 Ensure uniqueness after renaming (optional but handy)
+tree$tip.label <- make.unique(tree$tip.label, sep = "_")
+
+# 6. Plot (only add node labels if they exist)
+plot(tree, cex = 0.6, no.margin = TRUE)
+if (!is.null(tree$node.label)) nodelabels(tree$node.label, cex = 0.5, frame = "n")
+
+# 7. Plot to confirm
+par(mar = c(1,1,2,1) + 0.1)
+plot.phylo(tree, type = "phylogram", direction = "right", show.tip.label=TRUE,
+           use.edge.length = FALSE, cex = 0.6, label.offset = 1, 
+           main = "Maximum Likelihood with Support Values")
+add.scale.bar(cex = 0.7)
+nodelabels(tree$node.label, font = 2, bg = "white", frame = "r", cex = 0.5)
+```
+
+# Map effect sizes onto tree
+
+```{r}
+# Map effect sizes onto tree  
+
+## 1) Read tree (use your already-renamed tree if you saved it)
+# If 'tree' already exists in your session, skip this line
+#tree <- read.tree("data/UL.ml.renamed.newick")  # or "data/UL.ml.raxml.support" if you didn't save a renamed tree
+
+## 2) Drop outgroup and tiny edges
+tr <- drop.tip(tree, "Methanosarcina")
+tr$edge.length <- tr$edge.length + 1e-7
+tr <- ladderize(tr)
+
+## 3) Clean mapping
+trim <- function(x) trimws(as.character(x))
+map$strain <- trim(map$strain)
+map$phytip <- trim(map$phytip)
+map$skew   <- as.numeric(map$skew)
+
+# sanity on keys
+if (anyDuplicated(map$strain)) warning("Duplicate 'strain' keys in map; relabeling may be ambiguous.")
+if (anyDuplicated(map$phytip)) warning("Duplicate 'phytip' values; tip labels may not be unique.")
+
+## 4) Relabel tips to phytip
+strain2phy <- setNames(map$phytip, map$strain)
+hit <- tr$tip.label %in% names(strain2phy)
+tr$tip.label[hit] <- strain2phy[tr$tip.label[hit]]
+
+# Ensure uniqueness for phylo4d
+if (anyDuplicated(tr$tip.label)) {
+  tr$tip.label <- make.unique(tr$tip.label, sep = "_")
+}
+
+# Drop node labels (bootstrap numbers can cause issues)
+tr$node.label <- NULL
+
+## 5) Build the trait dataframe aligned to tree tips
+skew_vec     <- setNames(map$skew, map$phytip)
+phylab       <- tr$tip.label  # directly use the tip labels on the tree
+skew_on_tips <- as.numeric(skew_vec[phylab])
+
+if (anyNA(skew_on_tips)) {
+  warning("No 'skew' for: ", paste(phylab[is.na(skew_on_tips)], collapse = ", "))
+}
+
+dat <- data.frame(skew = skew_on_tips, row.names = phylab, check.names = FALSE)
+
+## 8) Plot and save
+
+png(filename="~/GitHub/metabolake/figures/FigTREE2.png",
+    width = 1200, height = 1200, res = 96*2, bg = "white")
+
+#par(mar=c(0.5,0.5,0.5,1.5) + 0.2)
+par(mar=c(0.5,0.5,0.5,1.5) + 0.2, oma = c(0.5, 0, 0, 0))
+
+table.phylo4d(
+  x,
+  treetype        = "phylogram",
+  symbol          = "colors",
+  show.node       = FALSE,
+  cex.label       = 0.7,
+  grid            = FALSE,
+  scale           = TRUE,
+  use.edge.length = FALSE,
+  edge.color      = "black",
+  edge.width      = 2,
+  box             = FALSE,
+  col             = mypalette(25),
+  pch             = 15,
+  cex.symbol      = 2,
+  font            = 2,
+  ratio.tree      = 0.75,
+  cex.legend      = 1.1,
+  center          = FALSE,
+  show.var.label  = TRUE
+)
+
+# Close Plot Device
+dev.off()
+graphics.off()
+
+# Show Plot
+img <- readPNG("~/GitHub/metabolake/figures/FigTREE2.png")
+
+grid.raster(img)
+```
+
+# Redo
+```{r}
+## 0) Read support tree and root on outgroup
+#tree <- read.tree("data/UL.ml.raxml.support")
+tree <- read.tree("data/UL.ml.raxml.support")
+
+tree <- root(tree, outgroup = "Methanosarcina", resolve.root = TRUE)
+
+# Optional: collapse ~zero branches, tidy, then drop outgroup for display
+tree <- di2multi(tree, tol = 1e-6)
+tree <- collapse.singles(tree)
+tr   <- drop.tip(ladderize(tree), "Methanosarcina")
+
+## 1) Fix any known tip typos on the current object (ID space)
+# Example: Surf1IUB2501 -> Surf1 to match mapping keys if needed
+tr$tip.label <- sub("IUB[0-9]+$", "", tr$tip.label)
+
+## 2) Read mapping and build 'phytip' (Genus + Strain)
+map <- read.csv("data/isolate.mapping.2.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    ID     = as.character(ID),
+    strain = as.character(strain),
+    genus  = as.character(genus),
+    phytip = trimws(paste(genus, strain))
+  )
+
+# Sanity on keys (warn only)
+if (anyDuplicated(map$ID))     warning("Duplicate IDs in map.")
+if (anyDuplicated(map$phytip)) warning("Duplicate phytip labels in map.")
+
+## 3) Relabel tips to phytip
+# If your tree tips are Surf*/Sed* IDs:
+id2phy <- setNames(map$phytip, map$ID)
+hit <- tr$tip.label %in% names(id2phy)
+if (!all(hit)) warning("Unmapped IDs in tree: ", paste(tr$tip.label[!hit], collapse=", "))
+tr$tip.label[hit] <- id2phy[tr$tip.label[hit]]
+
+# Ensure unique tip labels for phylobase
+if (anyDuplicated(tr$tip.label)) tr$tip.label <- make.unique(tr$tip.label, sep = "_")
+
+## 4) Build trait vector aligned to *phytip* tip labels
+map$skew <- as.numeric(map$skew)
+skew_vec <- setNames(map$skew, map$phytip)    # names = phytip
+phylab   <- tr$tip.label                       # final tip labels
+skew_on_tips <- skew_vec[phylab]
+
+if (anyNA(skew_on_tips)) {
+  warning("No 'skew' for: ", paste(phylab[is.na(skew_on_tips)], collapse = ", "))
+}
+
+dat <- data.frame(skew = as.numeric(skew_on_tips),
+                  row.names = phylab, check.names = FALSE)
+
+## 5) Build phylo4d object
+# Drop node labels (bootstrap numbers) to avoid duplicate-label warnings
+tr$node.label <- NULL
+x <- phylo4d(tr, tip.data = dat)
+
+## 6) Palette and figure
+BuRd <- c("#0571B0","#92C5DE","gray92","#F7F7F7","#F4A582","#CA0020")
+mypalette <- grDevices::colorRampPalette(BuRd)
+
+out_png <- "~/GitHub/metabolake/figures/FigTREE.png"
+dir.create(dirname(out_png), showWarnings = FALSE, recursive = TRUE)
+
+png(filename = out_png, width = 1400, height = 1200, res = 150, bg = "white")
+par(mar = c(0.5, 0.5, 0.5, 2.0) + 0.2, oma = c(0.5, 0, 0, 0))
+
+table.phylo4d(
+  x,
+  treetype        = "phylogram",
+  symbol          = "colors",
+  show.node       = FALSE,
+  cex.label       = 0.7,
+  grid            = FALSE,
+  scale           = TRUE,
+  use.edge.length = FALSE,
+  edge.color      = "black",
+  edge.width      = 2,
+  box             = FALSE,
+  col             = mypalette(25),
+  pch             = 15,
+  cex.symbol      = 2,
+  font            = 2,
+  ratio.tree      = 0.75,
+  cex.legend      = 1.1,
+  center          = FALSE,
+  show.var.label  = TRUE   # prints "skew" above the color column
+)
+dev.off(); graphics.off()
+
+# Quick display
+img <- readPNG(out_png); grid.raster(img)
+
+```
+
+
+
+```{r}
+
+
+## 1) Root first, then tidy, then drop outgroup for display
+tree <- read.tree("data/UL.ml.raxml.support")
+tree <- root(tree, outgroup="Methanosarcina", resolve.root=TRUE)
+tree <- di2multi(tree, tol=1e-6); tree <- collapse.singles(tree)
+tr   <- drop.tip(ladderize(tree), "Methanosarcina")
+
+## 2) Relabel tips to phytip ("Genus Strain")
+map <- read.csv("data/isolate.mapping.csv", stringsAsFactors=FALSE)
+map$phytip <- trimws(paste(map$genus, map$strain))
+# if tips are Surf/Sed IDs:
+tr$tip.label <- sub("IUB[0-9]+$", "", tr$tip.label)  # normalize Surf1IUB2501 -> Surf1 (if present)
+id2phy <- setNames(map$phytip, map$ID)
+hit <- tr$tip.label %in% names(id2phy)
+tr$tip.label[hit] <- id2phy[tr$tip.label[hit]]
+if (anyDuplicated(tr$tip.label)) tr$tip.label <- make.unique(tr$tip.label, sep="_")
+
+## 3) Build the skew data aligned to these labels
+map$skew <- as.numeric(map$skew)
+skew_vec <- setNames(map$skew, map$phytip)
+phylab   <- tr$tip.label
+dat      <- data.frame(skew=skew_vec[phylab], row.names=phylab, check.names=FALSE)
+
+## 4) Check monophyly of the trio on THIS tree
+genus <- sub("\\s+.*$", "", tr$tip.label)
+G <- tr$tip.label[genus %in% c("Bacillus","Lysinibacillus","Priestia")]
+mono <- is.monophyletic(tr, G)
+mono
+if (!mono) {
+  nd <- getMRCA(tr, G)
+  if (!is.na(nd)) {
+    intruders <- setdiff(extract.clade(tr, nd)$tip.label, G)
+    message("Not exclusive. Intruders in MRCA: ",
+            paste(unique(sub("\\s+.*$", "", intruders)), collapse=", "))
+  }
+}
+
+## 5) If monophyletic, rotate around the MRCA for a contiguous visual block
+tr_plot <- tr
+if (mono && length(G) >= 2) {
+  nd <- getMRCA(tr, G)
+  if (!is.na(nd)) tr_plot <- rotate(tr, node=nd)
+}
+
+## 6) Rebuild phylo4d with the (possibly rotated) tree and plot with colors
+tr_plot$node.label <- NULL
+phylab2 <- tr_plot$tip.label
+dat2    <- dat[phylab2, , drop=FALSE]   # order rows to the plotting tree
+x <- phylo4d(tr_plot, tip.data=dat2)
+
+BuRd <- c("#0571B0","#92C5DE","gray92","#F7F7F7","#F4A582","#CA0020")
+mypalette <- grDevices::colorRampPalette(BuRd)
+
+png("figures/Tree_skew.png", width=1400, height=1200, res=150, bg="white")
+par(mar=c(0.5,0.5,0.5,2.0)+0.2)
+table.phylo4d(
+  x, treetype="phylogram", symbol="colors", show.node=FALSE,
+  cex.label=0.7, grid=FALSE, scale=TRUE, use.edge.length=FALSE,
+  edge.color="black", edge.width=2, box=FALSE, col=mypalette(25),
+  pch=15, cex.symbol=2, font=2, ratio.tree=0.75, cex.legend=1.1,
+  center=FALSE, show.var.label=TRUE
+)
+dev.off(); graphics.off()
+
+# Quick display
+img <- readPNG(out_png); grid.raster(img)
+
+
+```
+
+
+
+
+
+
+
+
+
+## Phylogenetic tests on effect sizes
+
+```{r}
+
+# Blomberg's K:
+# K is a scaled ratio of the variance among species over the contrasts variance (the latter of which will be low if phylogenetic signal is high)
+# K, a variance ratio, is rescaled by dividing by the Brownian motion expectation. This gives it the property of having an expected value of 1.0 under Brownian evolution
+# Thus, K<1 indicates that closely related species resemble each other less than expected under the Brownian motion model of trait evolution. K>1 means that closely related species are more similar than predicted by the model. In other words, greater values of K suggest strongest effects of phylogenetic signal.
+
+# Load tree
+ml.tree <- read.tree("./data/phylogeny/RAxML_bipartitions.rpf.ml")
+
+# Root tree
+tree.rooted <- ape::root.phylo(ml.tree, outgroup = "Methanosarcina")
+
+# Drop unnecessary tips
+tips_to_drop <- setdiff(tree.rooted$tip.label, row.names(cohen.d))
+tree <- ape::drop.tip(tree.rooted, tips_to_drop)
+
+# Reorder the data to match tree tip labels
+cohen.d3 <- as.matrix(cohen.d[match(tree$tip.label, row.names(cohen.d)), ])
+print(tree$tip.label)
+print(row.names(cohen.d3))
+
+# Run test for Blomberg's K for Yield (A)
+result_K_A <- phylosig(tree, cohen.d3[, 1], method = "K", test = TRUE) # phylotools
+print(result_K_A)
+#Phylogenetic signal K : 0.360736 
+# P-value (based on 1000 randomizations) : 0.303 
+# K = 0.36 consistent with overdispersion of Rpf effect
+# But P = 0.303, so not significant
+
+# Run test for Blomberg's K for Yield (umax)
+result_K_umax <- phylosig(tree, cohen.d3[, 2], method = "K", test = TRUE) 
+print(result_K_umax)
+#Phylogenetic signal K : 1.01026 
+#P-value (based on 1000 randomizations) : 0.011 
+# K = 1.01 consistent with Brownian motion
+# P = 0.011 = significant
+
+# Run test for Blomberg's K for Yield (lag)
+result_K_lag <- phylosig(tree, cohen.d3[, 3], method = "K", test = TRUE) 
+print(result_K_lag)
+# Phylogenetic signal K : 0.207329 consistent with overdispersion of Rpf effect
+# P-value (based on 1000 randomizations) : 0.642 
+# But P = 0.642, so not significant
+
+
+# Pagel's Lambda:
+
+# when lambda = 0, there's no signal (polytomy)
+# when lambda = 1, consistent with Brownian motion
+# 0< lambda<1: intermediate level of phylogenetic signal, not as strong as Brownian
+# lamda >1: stronger than Brownian
+
+## Yield (A)
+phylosig(tree, cohen.d3[, 1], method = "lambda", test = T)
+# lambda = 0.319, P value = 0.638 ==> no phylogenetic signal
+
+# Maximum growth rate (umax)
+phylosig(tree, cohen.d3[, 2], method = "lambda", test = T)
+# lambda = 0.999934, P value = 0.02775 ==> Consistent with Brownian motion
+
+# Lag time (L)
+phylosig(tree, cohen.d3[, 3], method = "lambda", test = T)
+# lambda = 6.6107e-05, P value = 1 ==> no phylogenetic signal
+
+
+# Does Rpf effect size decrease with evolutionary distance to KBS0714?
+
+# Create sequence-based distance matrix {ape}
+seq.dist.raw <- dist.dna(rpf.DNAbin , model = "raw", pairwise.deletion = FALSE)
+seq.dist.mat <- as.matrix(dist(seq.dist.raw))
+
+# Retrieve the KBS0714 distances, drop outgroup, convert to similarity
+seq.dist.KBS0714 <- seq.dist.mat[,7]
+seq.dist.KBS0714 <- seq.dist.KBS0714[2:13]
+seq.sim.KBS0714 <- 1- seq.dist.KBS0714
+
+# Make data frame and order
+seq.sim.KBS0714 <- data.frame(names(seq.sim.KBS0714), seq.sim.KBS0714)
+colnames(seq.sim.KBS0714) <- c("Strain", "Similarity")
+seq.sim.KBS0714 <- seq.sim.KBS0714[order(seq.sim.KBS0714$Strain),]
+
+# Merge similarity with effect sizes
+cohen.d <-as.data.frame(cohen.d)
+cohen.d <- cohen.d[order(row.names(cohen.d)), ]
+seq.sim.final <- data.frame(cohen.d, seq.sim.KBS0714)
+
+seq.sim.A <- lm(seq.sim.final$A ~ seq.sim.final$Similarity, data = seq.sim.final)
+# summary(seq.sim.A)
+# plot(seq.sim.final$A,seq.sim.final$Similarity)
+# r2 = 0.18, P = 0.1645 
+
+seq.sim.umax <- lm(seq.sim.final$umax ~ seq.sim.final$Similarity, 
+        data = seq.sim.final)
+# summary(seq.sim.umax)
+# r2 = 0.3, P = 0.065 
+# plot(seq.sim.final$umax,seq.sim.final$Similarity)
+# cor.test(seq.sim.final$umax, seq.sim.final$Similarity, method = "spearman")
+# S = 490, rho = -0.71, p-value = 0.01211
+# there's a negative relationship, but it's pretty weak and not very compelling
+
+seq.sim.L <- lm(seq.sim.final$L ~ seq.sim.final$Similarity, data = seq.sim.final)
+# summary(seq.sim.L)
+# plot(seq.sim.final$umax,seq.sim.final$Similarity)
+# r2 = 0.01, P = 0.762 
+
+# summary: no evidence that Rpf effect is related to genetic distance to KBS0714
+```
+
+
+# Is the Rpf effect size correlated with traits (Lennon et al. 2012)
+
+```{r}
+# Load trait data
+g.traits <- read.delim("data/generality/traits.txt", sep = "\t", header = TRUE)
+g.traits <- cbind(g.traits, cohen.d[,1:3])
+colnames(g.traits)[14:16] <- c("A.effect", "umax.effect", "lag.effect")
+g.traits <- g.traits[!(g.traits$strain =="KBS0712"),]
+cor <- corr.test(g.traits[,2:16], method = "pearson")
+
+#updated
+# A effect: Mpamin = 0.044
+# umax effect: 
+
+# print(cor, digits = 3)
+# A.effect size correlated with Rmax: r = -0.557, p = 0.075
+# umax.effect size correlated with Wopt: r = 0.681, p = 0.021
+# umax.effect size correlated with niche breadth (b): r = -0.774, p = 0.005
+
+# Minimum moisture
+plot(g.traits$Mpamin, g.traits$A.effect)
+fit.MPamin <- lm(g.traits$A.effect ~ g.traits$Mpamin)
+#r2 = 0.7628, P = 0.0004443
+
+# Maximum respiration
+#plot(g.traits$Rmax, g.traits$A.effect)
+#fit.R <- lm(g.traits$A.effect ~ g.traits$Rmax)
+#r2 = 0.002524, P = 0.8834
+
+#plot(g.traits$lag.effect, g.traits$umax.effect)
+#fit.lag.umax <- lm(g.traits$umax.effect ~ g.traits$lag.effect)
+#r2 = 0.0473, P = 0.5206
+
+# Optimum water (transformed)
+Wopt.ab <- abs(g.traits$Wopt)
+log.Wopt <- log2(Wopt.ab)
+plot(log.Wopt,g.traits$umax.effect)
+fit.Wopt <- lm(g.traits$umax.effect ~ log.Wopt)
+#r2 = 0.4657, P = 0.02068
+
+# Niche breadth
+b.ab <- abs(g.traits$b)
+log.b <- log10(b.ab)
+plot(log.b,g.traits$umax.effect)
+fit.b <- lm(g.traits$umax.effect ~ log.b)
+#r2 = 0.3448, P = 0.05753
+
+# set plotting layout
+png(filename="~/GitHub/Rpf/figures/Fig6.png",
+    width = 800, height = 1600, res = 96*2)
+plot.new()
+par(oma=c(6, 6, 2, 5), mar=c(2, 4, 2, 4), mfrow=c(3, 1))
+par(mai=c(0.7, 0.4, 0.1, 0))
+
+# calculate regressions
+fit.A <- lm(A.effect ~ Mpamin, data = g.traits)
+pred.frameA <- data.frame(Mpamin = seq(-2.4, -0.01, by = 0.05))
+# F(1,9) = 28.95, p-value: 0.0004443, r2, = 0.7628
+
+# create minimum plot 
+plot(Mpamin ~ A.effect, g.traits, axes = F, type = "n",
+     xlab = "", ylab = "",
+     xlim = c(-2.6, 0), ylim = c(-3.5, 3.5), las = 1)
+box(lwd = 2)
+
+# Add hull confidence hulls and regression line
+add.hull(fit.A, pred.frameA)
+matlines(pred.frameA, predict(fit.A, 
+      interval = "c", newdata = pred.frameA), lty = c(3, 3, 3), 
+      lwd = c(2, 0, 0), col = "red")
+
+# Add points
+points(A.effect ~ Mpamin, g.traits,
+       pch = 21, col = "gray42", bg = "gray42", lwd = 2, cex = 1.5)
+
+# Add labels
+mtext(expression('Yield'), side = 2,
+     outer = FALSE, cex = 1.25, line = 2.5, adj = 0.5)
+
+mtext("Minimum moisture (MPa)", side = 1, line = 3.5, cex = 1.25)
+#mtext(expression(paste('(', mu , 'C-CO'[2]* ' g soil'^-1* 'd'^-1*')')), 
+#                       side = 1, line = 4.75, cex = 1)
+
+# Major Axes
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("-3", "0", "3"), at = c(-3, 0, 3))
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at=c(-3, 0, 3), labels = F)
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("-2.5", "-2", "-1.5", "-1", "-0.5", "0"), 
+     at = c(-2.5,-2,-1.5,-1,-0.5,0))
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(-2.5,-2,-1.5,-1,-0.5,0), labels = F)
+
+# Add stats and panel labels
+text(-0.1, 3, labels = "A", col = "black", cex = 2)
+text(-2.2, -2, labels = expression(r^2 == 0.76), cex = 1.25)
+text(-2.1, -2.95, labels = expression(italic("P")~" = 0.0004"), cex = 1.25)
+
+# panel 2
+
+# set plotting layout
+par(mai=c(0.4, 0.4, 0.4, 0))
+
+# calculate regressions
+fit.umax <- lm(umax.effect ~ Wopt, data = g.traits)
+pred.frame.u <- data.frame(Wopt = seq(-1.25, 0.2, by = 0.1))
+# F(1,9) = 10.66, p-value: 0.00976, r2, = 0.54
+
+# create minimum plot 
+plot(Wopt ~ umax.effect, g.traits, axes = F, type = "n",
+     xlab = "", ylab = "",
+     xlim = c(0.2, -1.25), ylim = c(-3.5, 3.5), las = 1)
+box(lwd = 2)
+
+# Add hull confidence hulls and regression line
+add.hull(fit.umax, pred.frame.u)
+matlines(pred.frame.u, predict(fit.umax, 
+      interval = "c", newdata = pred.frame.u), lty = c(3, 3, 3), 
+      lwd = c(2, 0, 0), col = "red")
+
+# Add points
+points(umax.effect ~ Wopt, g.traits,
+       pch = 21, col = "gray42", bg = "gray42", lwd = 2, cex = 1.5)
+
+# Add labels
+mtext(expression('Rpf effect size'), side = 2,
+      outer = FALSE, cex = 1.5, line = 6, adj = 0.5)
+
+mtext(expression(paste('',mu,'max')), side = 2, outer = FALSE, cex = 1.25, 
+         line = 2.5, adj = 0.5)
+
+mtext("Niche optimum (MPa)", side = 1, line = 3.5, cex = 1.25)
+#mtext("Water potential (MPa)", side = 1, line = 4.75, cex = 1)
+
+# Major Axes
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("-3", "0", "3"), at = c(-3, 0, 3))
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at=c(-2, 0, 2), labels = F)
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("0", "-0.5", "-1"), at = c(0, -0.5, -1))
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(0, -0.5, -1), labels = F)
+
+# Add stats and panel labels
+text(-1.2, 3, labels = "B", col = "black", cex = 2)
+text(0.006, -2, labels = expression(r^2 == 0.54), cex = 1.25)
+text(-0.02, -2.85, labels = expression(italic("P")~" = 0.01"), cex = 1.25)
+
+
+# panel 3
+
+# set plotting layout
+par(mai=c(0.1, 0.4, 0.7, 0))
+
+# calculate regressions
+fit.umax2 <- lm(umax.effect ~ b, data = g.traits)
+pred.frame.u2 <- data.frame(b = seq(-0.16, 1.28, by = 0.1))
+# F(1,9) = 7.76, p-value: 0.02118, r2, = 0.46
+
+# create minimum plot 
+plot(b ~ umax.effect, g.traits, axes = F, type = "n",
+     xlab = "", ylab = "",
+     xlim = c(-0.2, 1.25), ylim = c(-3.5, 3.5), las = 1)
+box(lwd = 2)
+
+# Add hull confidence hulls and regression line
+add.hull(fit.umax2, pred.frame.u2)
+matlines(pred.frame.u2, predict(fit.umax2, 
+      interval = "c", newdata = pred.frame.u2), lty = c(3, 3, 3), 
+      lwd = c(2, 0, 0), col = "red")
+
+# Add points
+points(umax.effect ~ b, g.traits,
+       pch = 21, col = "gray42", bg = "gray42", lwd = 2, cex = 1.5)
+
+# Add labels
+mtext(expression(paste('',mu,'max')), side = 2, outer = FALSE, cex = 1.25, 
+         line = 2.5, adj = 0.5)
+mtext("Niche breadth (MPa)", side = 1, line = 3.5, cex = 1.25)
+#mtext("Water potential (MPa)", side = 1, line = 4.75, cex = 1)
+
+# Major Axes
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("-3", "0", "3"), at = c(-3, 0, 3))
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at=c(-3, 0, 3), labels = F)
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("0", "0.5", "1"), at = c(0, 0.5, 1))
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(0, 0.5, 1), labels = F)
+
+# Add stats and panel labels
+text(1.15, 3, labels = "C", col = "black", cex = 2)
+text(-0.01, -2, labels = expression(r^2 == 0.46), cex = 1.25)
+text(0.035, -2.85, labels = expression(italic("P")~" = 0.021"), cex = 1.25)
+
+# Close Plot Device
+dev.off()
+graphics.off()
+
+# Show Plot
+img <- readPNG("~/GitHub/Rpf/figures/Fig6.png")
+grid.raster(img)
+```
+
+
+## Supplementary figure corresponding to two-way ANOVA
+Plot mean and SEM for growth parameter (yield, umax, lag) on each strain
+in both +Rpf and -Rpf treatments. 
+
+# Subset data
+
+```{r}
+# Order df.table
+
+sort.strain <- c("KBS0812", "KBS0724", "KBS0706", "KBS0702", "KBS0703", 
+                 "KBS0714", "KBS0715", "KBS0701", "KBS0711", "KBS0712", 
+                 "KBS0710", "KBS0705")
+
+gc.2 <- gc %>%
+  mutate(Strain =  factor(Strain, levels = sort.strain)) %>%
+  arrange(Strain) 
+
+# Yield (A) for +Rpf 
+A.plus <- filter(gc.2, Treatment == "Rpf+") %>%
+   dplyr::select(A, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.A = mean(A), SE.A = sem(A))
+
+# Yield (A) for -Rpf 
+A.minus <- filter(gc.2, Treatment == "Rpf-") %>%
+   dplyr::select(A, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.A = mean(A), SE.A = sem(A))
+
+# Max growth (umax) for +Rpf 
+umax.plus <- filter(gc.2, Treatment == "Rpf+") %>%
+   dplyr::select(umax, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.umax = mean(umax), SE.umax = sem(umax)) 
+
+# Max growth (umax) for -Rpf 
+umax.minus <- filter(gc.2, Treatment == "Rpf-") %>%
+   dplyr::select(umax, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.umax = mean(umax), SE.umax = sem(umax)) 
+
+# Lag time (L) for +Rpf 
+L.plus <- filter(gc.2, Treatment == "Rpf+") %>%
+   dplyr::select(L, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.L = mean(L), SE.L = sem(L)) 
+
+# Lag time (L) for -Rpf 
+L.minus <- filter(gc.2, Treatment == "Rpf-") %>%
+   dplyr::select(L, Strain) %>%
+   group_by(Strain) %>%
+   summarize(mean.L = mean(L), SE.L = sem(L)) 
+```
+
+# Make figure
+
+```{r}
+png(filename="~/GitHub/Rpf/figures/FigS6.png",
+    width = 1200, height = 1200, res = 96*2, bg = "white")
+
+plot.new()
+par(oma=c(9,5,0,0), mar=c(1,2,1,1), mfrow = c(3,1))
+ 
+# Created x-axis plotting locations
+x.Rpf.minus <- seq(from = 1, to = 46, by = 4)
+x.Rpf.plus <- seq(from = 2, to = 46, by = 4)
+
+# Plot means for yield
+plot(x.Rpf.minus, A.minus$mean.A, ylim = c(0, 2.5), xlim = c(0, 46), 
+     pch = 22, col = "black", bg = "white", lwd = 1, cex = 2.25, yaxt = "n", 
+     xaxt = "n", cex.lab = 2, cex.axis = 1.5, las = 1, ylab = "", xlab = "")
+      box(lwd = 2)
+      
+points(x.Rpf.plus, A.plus$mean.A, pch = 22, col = "black", bg = "grey", 
+       lwd = 1, cex = 2.25)
+
+# Plot -Rpf errors
+arrows(x0 = x.Rpf.minus, y0 = A.minus$mean.A, 
+       y1 = (A.minus$mean.A + A.minus$SE.A), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.minus, y0 = A.minus$mean.A, 
+       y1 = (A.minus$mean.A - A.minus$SE.A), angle = 90, length = 0.02, lwd = 1.5)
+
+# Plot +Rpf errors
+arrows(x0 = x.Rpf.plus, y0 = A.plus$mean.A, 
+       y1 = (A.plus$mean.A + A.plus$SE.A), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.plus, y0 = A.plus$mean.A, 
+       y1 = (A.plus$mean.A - A.plus$SE.A), angle = 90, length = 0.02, lwd = 1.5)
+
+# Major Axes
+
+x.int <-seq(from = 1.5, to = 46, by = 4)
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = F, at = x.int, las =3)
+
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("0.0", "0.5", "1.0", "1.5", "2.0", "2.5"), at = c(0,0.5,1.0,1.5,2.0,2.5))
+
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(0,0.5,1.0,1.5,2.0, 2.5), labels = F)
+
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = x.int, labels = F)
+
+mtext(expression('Yield (OD600)'), side = 2,
+      outer = FALSE, cex = 1.25, line = 4, adj = 0.5)
+
+# Add p-values
+text(6, 2.4, labels = expression("Treatment x Strain:" ~italic("P")~"= 0.003"), cex = 1)
+
+legend(42, 2.5, c("-Rpf", "+Rpf"), pch = 22, pt.bg = c("white", "grey"), 
+       pt.cex = 2, pt.lwd = 1, bty = 'n', y.intersp = 1)
+
+
+# Plot means for umax
+plot(x.Rpf.minus, umax.minus$mean.umax, ylim = c(0.01, 0.21), xlim = c(0, 46), 
+     pch = 22, col = "black", bg = "white", lwd = 1, cex = 2.25, yaxt = "n", 
+     xaxt = "n", cex.lab = 2, cex.axis = 1.5, las = 1, ylab = "", xlab = "")
+      box(lwd = 2)
+      
+points(x.Rpf.plus, umax.plus$mean.umax, pch = 22, col = "black", bg = "grey", 
+       lwd = 1, cex = 2.25)
+
+# Plot -Rpf errors
+arrows(x0 = x.Rpf.minus, y0 = umax.minus$mean.umax, 
+       y1 = (umax.minus$mean.umax + umax.minus$SE.umax), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.minus, y0 = umax.minus$mean.umax, 
+       y1 = (umax.minus$mean.umax - umax.minus$SE.umax), angle = 90, length = 0.02, lwd = 1.5)
+
+# Plot +Rpf errors
+arrows(x0 = x.Rpf.plus, y0 = umax.plus$mean.umax, 
+       y1 = (umax.plus$mean.umax + umax.plus$SE.umax), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.plus, y0 = umax.plus$mean.umax, 
+       y1 = (umax.plus$mean.umax - umax.plus$SE.umax), angle = 90, length = 0.02, lwd = 1.5)
+
+# Major Axes
+x.int <-seq(from = 1.5, to = 46, by = 4)
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = F, at = x.int, las =3)
+
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("0.02","0.08","0.14", "0.2"), at = c(0.02, 0.08, 0.14, 0.2))
+
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(0.02, 0.08, 0.14, 0.2), labels = F)
+
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = x.int, labels = F)
+  
+mtext(expression(mu [max]* ' (hr'^-1*')'), side = 2,
+ outer = FALSE, cex = 1.25, line = 4, adj = 0.5)
+
+# Add p-values
+text(6, 0.2, labels = expression("Treatment x Strain:" ~italic("P")~"<0.0001"), cex = 1)
+
+
+# Plot means for Lag
+plot(x.Rpf.minus, L.minus$mean.L, ylim = c(0, 45), xlim = c(0, 46), 
+     pch = 22, col = "black", bg = "white", lwd = 1, cex = 2.25, yaxt = "n", 
+     xaxt = "n", cex.lab = 2, cex.axis = 1.5, las = 1, ylab = "", xlab = "")
+      box(lwd = 2)
+      
+points(x.Rpf.plus, L.plus$mean.L, pch = 22, col = "black", bg = "grey", 
+       lwd = 1, cex = 2.25)
+
+# Plot -Rpf errors
+arrows(x0 = x.Rpf.minus, y0 = L.minus$mean.L, 
+       y1 = (L.minus$mean.L + L.minus$SE.L), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.minus, y0 = L.minus$mean.L, 
+       y1 = (L.minus$mean.L - L.minus$SE.L), angle = 90, length = 0.02, lwd = 1.5)
+
+# Plot +Rpf errors
+arrows(x0 = x.Rpf.plus, y0 = L.plus$mean.L, 
+       y1 = (L.plus$mean.L + L.plus$SE.L), angle = 90, length = 0.02, lwd = 1.5)
+
+arrows(x0 = x.Rpf.plus, y0 = L.plus$mean.L, 
+       y1 = (L.plus$mean.L - L.plus$SE.L), angle = 90, length = 0.02, lwd = 1.5)
+
+# Major Axes
+x.int <-seq(from = 1.5, to = 46, by = 4)
+
+axis(side = 1, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = sort.strain, at = x.int, las =3, col.axis = "gray40")
+
+axis(side = 2, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     labels = c("0", "10", "20", "30","40"), at = c(0,10,20,30,40))
+
+axis(side = 4, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = c(0,10,20,30,40), labels = F)
+
+axis(side = 3, lwd.ticks = 2, cex.axis = 1.25, las = 1,
+     at = x.int, labels = F)
+
+mtext(expression('Lag time (hr)'), side = 2,
+      outer = FALSE, cex = 1.25, line = 4, adj = 0.5)
+
+# Add p-values
+text(3.5, 42, labels = expression("Strain:" ~italic("P")~"< 0.0001"), cex = 1)
+#text(4.2, 33, labels = expression("Treatment:" ~italic("P")~"< 0.0001"), cex = 1)
+
+# Add taxon names and lines
+mtext('Gram +', side = 1, line = 8, at = 15, cex = 1.25)
+mtext('Gram -', side = 1, line = 8, at = 37, cex = 1.25)
+
+par(xpd=NA)
+segments(1, -35, 26, -35, col = "black", lwd = 2)
+segments(29, -35, 46, -35, col = "black", lwd = 2)
+
+# Close Plot Device
+dev.off()
+graphics.off()
+
+# Show Plot
+img <- readPNG("./figures/FigS6.png")
+
+grid.raster(img)
+```
